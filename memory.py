@@ -3,7 +3,7 @@ import numpy as np
 import tensorflow as tf 
 import matplotlib.pyplot as plt 
 from tensorflow.keras import Model
-from tensorflow.keras.layers import Dense, Input, Layer
+from tensorflow.keras.layers import Dense, Input, Layer, LSTM
 
 
 # TODO: Different similarity measure
@@ -14,7 +14,6 @@ tf.keras.backend.set_floatx('float64')
 
 
 class NTM(Model):
-    
     def __init__(self, length=10, memshape=None, output_dim=1, logits=100, training=True,**kwargs):
         # initialise the superclass
         super(NTM, self).__init__(name="Exuberant_Witness",**kwargs)
@@ -33,17 +32,20 @@ class NTM(Model):
         self.reverie = Reverie(memshape=self.memshape, ident=None)
         # save initial state of previous memory
         self.prev_mem = self.reverie.memory
-        # construct base input network
-        self.network_in = Dense(self.logits, activation="relu", name="Controller_dense_in", input_shape=[length])
-        # construct base output network
-        self.network_out = Dense(self.logits, activation="relu", name="Controller_dense_out", input_shape=[memshape[-1]]) 
-        # instantiate the read head
-        self.read_head = RevReadHead(self.reverie, input_dim=self.logits, network_topology=None)
-        # instantiate write head
-        self.write_head = RevWriteHead(self.reverie, input_dim=self.logits)
-        # final layer to map to appropriate output dimensions
-        self.model_out = Dense(self.output_dim, activation="relu" ,use_bias=True, name="NTM_out")
+        # number of read heads
+        self.read_num = len(read_heads)
+        #number of write heads
+        self.write_num = len(write_heads)
+        # instantiate the read heads
+        self.read_array = []
+        for i in range(self.read_num):
+            self.read_array.append(RevReadHead(network_topology=read_heads[i][0], input_dim=read_heads[i][1]))
+        # instantiate the write heads
+        self.write_array = []
+        for i in range(self.read_num):
+            self.write_array.append(RevWriteHead(network_topology=read_heads[i][0], input_dim=read_heads[i][1]))
 
+        self.memory_controller = LSTM(units=logits, activation='tanh', recurrent_activation="sigmoid", use_bias=True)
 
     def train_step(self, data):
         """
@@ -161,12 +163,9 @@ class RevInterface(Layer):
     the weight vector 
     """
 
-    def __init__(self, reverie):
+    def __init__(self, memory_shape):
         # setup superclass inheritance 
         super(RevInterface, self).__init__()
-            
-        # store pointer to the memory class
-        self.reverie = reverie
 
         # compute and store memory size
         self.mem_input_dim = self.reverie.memshape[1]
