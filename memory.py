@@ -6,20 +6,24 @@ from tensorflow.keras import Model
 from tensorflow.keras.layers import Dense, Input, Layer, LSTM
 
 
-# TODO: Different similarity measure
-# TODO: Implement variable shift vectors
+#TODO: Implement multiple write heads
+#TODO: Implement multiple memory types
+#TODO: Different 
 
 # set default precision
 tf.keras.backend.set_floatx('float64')
 
 
 class NTM(Model):
-    def __init__(self, length=10, memshape=None, output_dim=1, logits=100, training=True,**kwargs):
+    def __init__(self, length=10, memshape=[10,10], output_dim=1, logits=100, training=True,**kwargs):
         # initialise the superclass
         super(NTM, self).__init__(name="Exuberant_Witness",**kwargs)
 
         # store desired memshape
-        self.memshape = memshape
+        self.memrows = memshape[0]
+        self.memcolss = memshape[1]
+        # decay parameter
+        self.gamma = 0.95
         # store desired output dimension for read heads
         self.output_dim = output_dim
         # store number of logits for internal network
@@ -28,24 +32,113 @@ class NTM(Model):
         self.input_length = length
         # store training flag
         self.training = training
-        # instantiate memory
-        self.reverie = Reverie(memshape=self.memshape, ident=None)
-        # save initial state of previous memory
-        self.prev_mem = self.reverie.memory
         # number of read heads
         self.read_num = len(read_heads)
         #number of write heads
         self.write_num = len(write_heads)
-        # instantiate the read heads
+        assert self.write_num==1, "Only a single write head is currently supported"
+         # instantiate the read heads
         self.read_array = []
         for i in range(self.read_num):
             self.read_array.append(RevReadHead(network_topology=read_heads[i][0], input_dim=read_heads[i][1]))
         # instantiate the write heads
         self.write_array = []
-        for i in range(self.read_num):
-            self.write_array.append(RevWriteHead(network_topology=read_heads[i][0], input_dim=read_heads[i][1]))
+        for i in range(self.write_num):
+            self.write_array.append(RevWriteHead(network_topology=read_heads[i][0], read_num=self.read_num))
+        # initialise the memory controller (talks to the read/write heads)
+        self.memory_controller = LSTM(units=logits, return_state=True, activation='tanh', recurrent_activation="sigmoid", use_bias=True)
 
-        self.memory_controller = LSTM(units=logits, activation='tanh', recurrent_activation="sigmoid", use_bias=True)
+
+    def call(self, x, prev_state, training=False):
+        """ 
+        Calls the neural turing machine on an input and produces the networks prediction. 
+        """
+
+        # retrieve previous state of arry
+        A, wr_prev, ww_prev, wu_prev, read_prev = self.prev_state["memory"], self.prev_state["read_weight"], self.prev_state["write_weight"], self.prev_state["usage_weight"], self.prev_state["read_vector"]
+
+        # concatenate weights of read heads
+        total_prev_weights = tf.concat(self.prev_weights, axis=-1)
+
+        # concatenate all inputs to LSTM head
+        controller_input = tf.concat([x, total_prev_weights], axis=-1)
+
+        # pass input and previous controller state 
+        controller_output, controller_h, controller_c = self.controller(controller_input, initial_state=self.lstm_state)
+
+        # package output state
+        self.lstm_state = [controller_h, controller_c]
+
+        # get previous least used
+        least_indices, wlu_prev = self.least_used(wu_prev)
+
+        # pass the controller output to the read heads and get memory read weights
+        read_weights = []
+        kts = []
+        for i in range(self.read_num):
+            # produces the read head weights and keys
+            kt, wr = self.read_array[i].read_head_address(controller_output, A)
+            kts.append(kt)
+            read_weights.append(wr)
+
+        # pass the controller output to the write heads and get memory write weights
+        write_weights = []
+        for i in range(self.read_num):
+            # produces the read head weights
+            weights = self.read_array[i].write_head_address(controller_output, wr_prev, wlu_prev)
+            write_weights.append(weights)
+
+        # create least used weight vector, averaging read vectors
+        wlu = []
+        for i in range(self.read_num):
+            updated_usage = self.gamma * wlu_prev[i] + reduce_sumread_weights[i] + write_weights[i]
+            wlu.append(updated_usage)
+
+        # zero least used memory
+        A = A * tf.expand_dims(1 - tf.one_hot(least_indices))
+
+        # write to memory using least access information and sum over batches
+        for i in range(self.read_num):
+            A = tf.tanh(A + tf.einsum('bi,bj->ij', write_weights[i], kts[i]))
+
+            
+        # get read vector using using write weights and updated memory
+        read_vectors = []
+        for i in range(self.read_num):
+            read_vectors.append(  tf.einsum('mi,ij->mj', read_weights[i], A))
+
+
+        # # if in training mode, make sure we are writing to memory
+        # if training:
+        #     # apply new data to memory block
+        #     new_mem = self.write_head(dense_out, training=training)
+        #     # update memory block
+        #     self.prev_mem = new_mem
+        #     # update the memory state
+        #     self.reverie.force_write(self.prev_mem)
+            
+        # # pass to read head
+        # read = self.read_head(dense_out, training=training)
+        # # pass retrieved memory to network output
+        # network_out = self.network_out(read, training=training)
+        # # and final output
+        # ntm_output = self.model_out(network_out, training=training)
+
+        # return output of network
+        read_outputs = tf.concat(read_vectors, axis=-1)
+        ntm_output = tf.concat([controller_output, read_outputs], axis=-1)
+
+        # package iteration state
+        self.prev_state = {"memory": A,
+                         "read_weight": wr_t,
+                         "write_weight": ww_t,
+                         "read_vectors":read_vectors,
+                         "usage_weight":wu_t
+                         }
+
+
+        return ntm_output, current_state
+
 
     def train_step(self, data):
         """
@@ -76,36 +169,6 @@ class NTM(Model):
         return {m.name: m.result() for m in self.metrics}
 
 
-    def call(self, x, training=False):
-        """ 
-        Calls the neural turing machine on an input and produces the networks prediction. 
-        """
-        
-        # apply network input 
-        dense_out = self.network_in(x, training=training)
-        
-
-        # if in training mode, make sure we are writing to 
-        if training:
-            # apply new data to memory block
-            new_mem = self.write_head(dense_out, training=training)
-            # update memory block
-            self.prev_mem = new_mem
-            # update the memory state
-            self.reverie.force_write(self.prev_mem)
-            
-        # pass to read head
-        read = self.read_head(dense_out, training=training)
-        # pass retrieved memory to network output
-        network_out = self.network_out(read, training=training)
-        # and final output
-        ntm_output = self.model_out(network_out, training=training)
-
-        
-        
-
-
-        return ntm_output
 
     def save_model(self, path, weight_name=r"\Neural_weights.h5", memory_name=r"\memory_block.npy"):
         """
@@ -168,38 +231,8 @@ class RevInterface(Layer):
         super(RevInterface, self).__init__()
 
         # compute and store memory size
-        self.mem_input_dim = self.reverie.memshape[1]
-        self.mem_output_dim = self.reverie.memshape[0]
-
-        # initialise weight history
-        self.prev_weight = tf.convert_to_tensor(1e-2*np.ones((1, self.mem_output_dim), dtype=np.float64))
-
-
-    def head_control(self, key, beta, gate_interp, shift, gamma, training=False):
-        """
-        Maps the head control signals to correct ranges for read/write access to memory.
-        These signals comes from a neural network of some kind and can take on any real value
-        """
-
-
-        # normalise beta
-        beta = tf.math.softplus(beta)
-
-        # remap gate interpolation
-        gate_interp = tf.nn.sigmoid(gate_interp)
-
-        # normalise shift vector
-        shift = tf.nn.softmax(shift)
-
-        # force gamma power to be strictly increasing
-        gamma = tf.nn.softplus(gamma) + 1
-
-        # compute weight vector
-        head_weight = self.reverie.weight_compute(key, beta, gate_interp, shift, gamma, self.prev_weight)
-
-
-        return head_weight
-
+        self.memcols = self.reverie.memshape[1]
+        self.memrows = self.reverie.memshape[0]
 
 
 # we use seperate read and write head classes since they may not always match in number
@@ -212,40 +245,37 @@ class RevReadHead(RevInterface):
         super(RevReadHead, self).__init__(reverie)
  
         # compute and store required network depth
-        self.layer_width = self.mem_input_dim + 6
+        self.layer_dim = self.memcols
 
         # network topology for controller head
-        if network_topology is None:
-            self.head_out = Dense(self.layer_width, input_shape=(input_dim,), name="Read_controller")
+        if network_topology is 'ff':
+            self.head_out = Dense(self.layer_dim, name="Read_controller")
         else:
             raise NotImplementedError("Custom heads not yet implemented")
 
     # overwrite tensorflow call method with our own
-    def call(self, input_data, training=False):
+    def read_head_address(self, controller_input, memory, training=False):
         """
         Applies read head to input data vector and produces memory read output
         """
 
+        # compute key vector and force to be between [-1, 1]
+        kt = tf.tanh(self.head_out(controller_input))
 
-        # apply head network to input data
-        head_output_data = self.head_out(input_data)
+        # compute inner product bewteen key vector and memory rows
+        inner_product = tf.einsum('bj,ij->bi', kt, memory)
 
-        # split head output data and control signals
-        output_shape = [self.mem_input_dim, 1,1,1,3]
-        key, beta, gate_interp, gamma, shift = tf.split(head_output_data, output_shape, axis=-1)
+        # compute norm of components
+        k_norm = tf.math.sqrt(tf.reduce_sum(tf.math.square(k), 2))
+        memory_norm = tf.math.sqrt(tf.reduce_sum(tf.math.square(A), 2))
+        norm = k_norm * memory_norm
 
-        # use to retrieve memory 
-        w = self.head_control(key, beta, gate_interp, shift, gamma, training=training)
-        
-        # store internal rep of memory (only update if training has begun, lest we overwrite)
-        if training:
-            self.prev_weight = w
+        # compute cosine similarity function
+        K = inner_product / (norm + 1e-16)
 
+        # compute softmax normalisation
+        return kt, tf.nn.softmax(K, axis=-1)
 
-        # use computed weight to perform read operation
-        mem_read = self.reverie.read_memory(w)
-
-        return mem_read
 
     def compute_output_shape(self, input_shape):
         assert isinstance(input_shape, list)
@@ -266,49 +296,47 @@ class RevReadHead(RevInterface):
         return [self.output_dim, self.output_dim]
 
 
+
 class RevWriteHead(RevInterface):
     """
     Performs write operations on memory instances
     """
 
-    def __init__(self, reverie, input_dim, network_topology=None):
+    def __init__(self, read_num, network_topology=None):
         # initiailise controller interface
-        super(RevWriteHead, self).__init__(reverie)
- 
-        # compute and store required network depth (need add and erase channels here as well)
-        self.layer_width = 3*self.mem_input_dim + 6
+        super(RevReadHead, self).__init__(reverie)
+    
+        # number of read heads
+        self.read_num = read_num
+
+        # require a single parameter network (need alpha and gamma)
+        self.layer_dim = self.read_num 
 
         # network topology for controller head
-        if network_topology is None:
-            self.head_out = Dense(self.layer_width, input_shape=(input_dim,))
+        if network_topology is 'ff':
+            self.head_out = Dense(self.layer_dim, name="Write_controller")
         else:
             raise NotImplementedError("Custom heads not yet implemented")
 
     # overwrite tensorflow call method with our own
-    def call(self, input_data, training=False):
+    def write_head_address(self, controller_input, wr_prev, wlu_prev, training=False):
         """
-        Applies read head to input data vector and produces memory read output
+        Applies read head to input data vector and produces memory write output
         """
 
         # apply head network to input data
-        head_output_data = self.head_out(input_data)
-    
-        # split head output data and control signals
-        output_shape = [self.mem_input_dim, 1,1,1,3, self.mem_input_dim, self.mem_input_dim]
-        key, beta, gate_interp, gamma, shift, erase, add = tf.split(head_output_data, output_shape, axis=-1)
+        head_output_data = tf.tanh(self.head_out(input_data), axis=-1)
 
-        # remap erase vector
-        erase = tf.math.sigmoid(erase)
+        # extract alpha and gamma
+        alpha = tf.sigmoid(head_output_data)
 
-        # use to retrieve memory 
-        w = self.head_control(key, beta, gate_interp, shift, gamma)
-        # update saved weight
-        self.prev_weight = w
-        
-        # write to memory location
-        self.reverie.write_memory(w, erase, add)
+        # return convex combination of previous read weights and write weights
+        write_weights = []
+        for i in range(self.read_num):
+            write_weights.append(  alpha[i] * wr_prev[i] + (1-alpha[i])*wlu_prev[i]  )
 
-        return self.reverie.memory
+        return write_weights
+
 
     def compute_output_shape(self, input_shape):
         assert isinstance(input_shape, list)
@@ -327,148 +355,6 @@ class RevWriteHead(RevInterface):
     @property
     def output_size(self):
         return [self.output_dim, self.output_dim]
-
-
-
-class Reverie(object):
-    """
-    Memory object for neural turing machine. Initialises/retrieves a 
-    model memory given input parameters. 
-    """
-
-    def __init__(self, memshape=None, filename=None, ident=None):
-        # parse input parameters and setup our system memory
-        super(Reverie, self).__init__()
-
-        # check if we are  reading memory from file
-        if filename is None:
-            if memshape is None:
-                # set default memory shape
-                print("No memory file specified and memshape is {}: using default memory size of (40,20)".format(memshape))
-                self.memshape = [40,20]
-            else:
-                self.memshape = memshape
-
-            # initialise memory using small but not machine precision values
-            self.memory = tf.convert_to_tensor(np.random.rand(*self.memshape)*(1e-1), dtype=tf.float64)
-
-        else:
-            # save filename into internal memory 
-            self.filename = filename
-            # use retreival service to get saved memory 
-            self.memory, self.memshape = memget(self.filename)
-
-        # use current milliseconds as system id
-        if ident is None:
-            self.ident = datetime.datetime.now().microsecond
-
-
-    def read_memory(self, weight):
-        """
-        Applies read operation on memory block according
-        """
-
-        # compute weighted sum of row vectors that form memory
-        rt = tf.linalg.matvec(tf.transpose(self.memory), weight)
-
-        return rt
-
-
-    def write_memory(self, weight, erase, add):
-        """
-        Applies write operation on memory block according to 
-        """
-        #TODO: Unclear how to handle batch dimension in the memory write
-
-        # compute erasure matrix
-        erase_mat = 1 - tf.einsum("ij,ik->ijk", weight, erase)
-        # compute memory elementwise multiplication
-        erase_mem = tf.einsum('kl,ikl->ikl', self.memory, erase_mat)
-        # compute add operation
-        add_mem = tf.einsum('ij,ik->ijk', weight, add)
-
-        # apply update to memory state and collapse batch write
-        self.memory = tf.reduce_sum(erase_mem + add_mem, axis=0)
-
-        return self.memory
-
-
-    def weight_compute(self, key, beta, gate_interp, shift, gamma, prev_weight):
-        """
-        Computes content/location based memory weight vector. 
-        """ 
-
-        # first compute cosine similarity of key with memory
-        content_weight = self.weight_content_compute(key, beta)
-
-
-        # now compute the interpolation gate value
-        gated_weight = gate_interp*content_weight + (1-gate_interp)*prev_weight
-
-        # compute gate convolution
-        shifted_weight = self.weight_shift(gated_weight, shift)
-
-        # apply sharpening
-        numerator = tf.pow(shifted_weight, gamma)
-        w = numerator/tf.math.reduce_sum(numerator)
-
-        return w
-        
-
-    def weight_content_compute(self, key, beta, metric="cosine"):
-        """
-        Computes overlap of key with each memory location
-        """
-
-
-        if metric is "cosine":
-            #Kuv = 1 - tf.keras.losses.cosine_similarity(key, self.memory, axis=1)
-            # compute cosine distance over memory matrix and batches
-            Kuv = cosine_distance(key, self.memory)
-            print(Kuv)
-            # apply softmax to output in order to normalise and determine content focus
-            wct = tf.nn.softmax(beta*Kuv, axis=1, name="content_weight_normalisation_{}".format(self.ident))
-            print(wct)
-            print()
-        else: 
-            raise ValueError("Unrecognised similarity metric requested: {}".format(metric))
-
-        return wct
-
-
-    def weight_shift(self, weight, shift):
-        """
-        Computes continuous shift operation on input weight vector
-        """
-
-        # pad shift matrix to length of weight matrix
-        batch_size = np.shape(weight)[0]
-
-        shift = tf.pad(shift, paddings=tf.constant([[0,0],[0,np.shape(weight)[-1]-np.shape(shift)[-1]]]))
-
-        # construct circulant matrix
-        shift_list = tf.TensorArray(tf.float64, size=0, dynamic_size=True)
-        # write to first index of array
-        for i in range(0, np.shape(weight)[-1]):
-            shift_list = shift_list.write(shift_list.size(),shift)
-
-        # stack vectors
-        shift_mat = tf.transpose(shift_list.stack(), perm=[1,0,2])
-
-        # apply shift to weight and return 
-        weight_shift = tf.einsum("ijk,ik->ij", shift_mat, weight)
-
-        return weight_shift
-
-    def force_write(self, memory):
-        """
-        Assigns memory block
-        """
-
-        # check memory size is preserved
-        #assert np.all(np.shape(memory) == np.shape(self.memory)), "Assigned memory does not match new one"
-
-        self.memory = tf.clip_by_norm(tf.identity(memory), np.shape(memory)[0], axes=1)
 
 
 def model_retrieve(model_path, input_shape, memshape, output_dim, logits, batch_size):
