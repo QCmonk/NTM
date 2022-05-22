@@ -1,7 +1,6 @@
 import os
 import numpy as np
 import tensorflow as tf 
-import matplotlib.pyplot as plt
 from scipy.special import softmax
 from tensorflow.keras import Model
 from tensorflow.python.ops import summary_ops_v2
@@ -14,7 +13,7 @@ import memory as mm
 
 
 # set default precision
-tf.keras.backend.set_floatx('float64')
+tf.keras.backend.set_floatx('float32')
 
 # set thread level
 num_threads = 6
@@ -35,9 +34,9 @@ dim = 8
 # temporal length
 tlen = 10
 # write head specification
-write_heads = [["ff", 100]]
+write_heads = 1
 # read head specification
-read_heads = [["ff"], 10]
+read_heads = 1
 # memory shape
 memory_shape = [128,20]
 # learning rate
@@ -56,9 +55,21 @@ train = True
 
 ###### Network setup ######
 # leverage Keras sequential model layers
-model_input = Input(shape=())
+model_input = Input(shape=(tlen, dim), dtype=tf.float32)
+# the NTM unit
+ntm = mm.NTM(read_num=read_heads, write_num=write_heads ,memshape=[100,10])
+# the output of the ntm
+output = ntm(model_input)
+# define model input/outputs
+model = Model([model_input], output)
 
 
+# setup optimiser
+opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+# compile the model
+model.compile(optimizer=opt, loss=None, metrics=[])
+# print a summary
+model.summary()
 
 ##### Performance analysis
 

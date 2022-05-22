@@ -1,27 +1,26 @@
 import datetime
 import numpy as np
-import tensorflow as tf 
-import matplotlib.pyplot as plt 
+import tensorflow as tf  
 from tensorflow.keras import Model
 from tensorflow.keras.layers import Dense, Input, Layer, LSTM
 
 
 #TODO: Implement multiple write heads
 #TODO: Implement multiple memory types
-#TODO: Different 
+#TODO: Should the multiread/write head weights really be summed? 
 
 # set default precision
-tf.keras.backend.set_floatx('float64')
+tf.keras.backend.set_floatx('float32')
 
 
 class NTM(Model):
-    def __init__(self, length=10, memshape=[10,10], output_dim=1, logits=100, training=True,**kwargs):
+    def __init__(self, read_num, write_num, length=10, output_dim=1, memshape=[10,10], logits=100, training=True,**kwargs):
         # initialise the superclass
         super(NTM, self).__init__(name="Exuberant_Witness",**kwargs)
 
         # store desired memshape
         self.memrows = memshape[0]
-        self.memcolss = memshape[1]
+        self.memcols = memshape[1]
         # decay parameter
         self.gamma = 0.95
         # store desired output dimension for read heads
@@ -33,38 +32,65 @@ class NTM(Model):
         # store training flag
         self.training = training
         # number of read heads
-        self.read_num = len(read_heads)
+        self.read_num = read_num
         #number of write heads
-        self.write_num = len(write_heads)
+        self.write_num = write_num
         assert self.write_num==1, "Only a single write head is currently supported"
-         # instantiate the read heads
+        
+        # instantiate the read heads
         self.read_array = []
         for i in range(self.read_num):
-            self.read_array.append(RevReadHead(network_topology=read_heads[i][0], input_dim=read_heads[i][1]))
+            self.read_array.append(RevReadHead(memory_shape=memshape))
         # instantiate the write heads
         self.write_array = []
         for i in range(self.write_num):
-            self.write_array.append(RevWriteHead(network_topology=read_heads[i][0], read_num=self.read_num))
+            self.write_array.append(RevWriteHead(memory_shape=memshape))
+        
         # initialise the memory controller (talks to the read/write heads)
-        self.memory_controller = LSTM(units=logits, return_state=True, activation='tanh', recurrent_activation="sigmoid", use_bias=True)
+        self.memory_controller = LSTM(units=self.logits, return_state=True, activation='tanh', recurrent_activation="sigmoid", use_bias=True)
+        
+        # build the initial state of the network
+        A = tf.ones(shape=[self.memrows, self.memcols], dtype=tf.float32)*1e-4
+        read_weights_sum = tf.zeros(shape=(1, self.memcols), dtype=tf.float32)
+        write_weights = tf.zeros(shape=[1, self.memrows], dtype=tf.float32)
+        wu = tf.zeros(shape=[1, self.memrows], dtype=tf.float32)
+        self.lstm_state = [tf.zeros(shape=[1, self.logits], dtype=tf.float32)]*2
 
 
-    def call(self, x, prev_state, training=False):
+        # assign initial values
+        self.prev_state = {"memory": A,
+                 "read_weight": read_weights_sum,
+                 "write_weight": write_weights,
+                 "usage_weight": wu
+                 }
+
+
+
+    def abc(self, x, training=False, **kwargs):
+        """
+        Calls the complete neural turing machine on a sequence of inputs.
+        """
+
+        # repeatedly apply instance map to the
+        output_sequence = tf.scan(fn=lambda init, elem: self.instance_map(elem, training=training), elems=tf.transpose(x, perm=[1,0,2]))
+
+        # remove tranposition of matrices
+        return tf.transpose(output_sequence, perm=[1,0,2])
+
+
+    def __call__(self, x, training=False):
         """ 
-        Calls the neural turing machine on an input and produces the networks prediction. 
+        Calls the neural turing machine on a single time slice and outputs the instance
         """
 
         # retrieve previous state of arry
-        A, wr_prev, ww_prev, wu_prev, read_prev = self.prev_state["memory"], self.prev_state["read_weight"], self.prev_state["write_weight"], self.prev_state["usage_weight"], self.prev_state["read_vector"]
-
-        # concatenate weights of read heads
-        total_prev_weights = tf.concat(self.prev_weights, axis=-1)
+        A, wr_prev, ww_prev, wu_prev = self.prev_state["memory"], self.prev_state["read_weight"], self.prev_state["write_weight"], self.prev_state["usage_weight"]
 
         # concatenate all inputs to LSTM head
-        controller_input = tf.concat([x, total_prev_weights], axis=-1)
+        controller_input = tf.concat([x, wr_prev], axis=-1)
 
         # pass input and previous controller state 
-        controller_output, controller_h, controller_c = self.controller(controller_input, initial_state=self.lstm_state)
+        controller_output, controller_h, controller_c = self.memory_controller(controller_input, initial_state=self.lstm_state)
 
         # package output state
         self.lstm_state = [controller_h, controller_c]
@@ -81,27 +107,22 @@ class NTM(Model):
             kts.append(kt)
             read_weights.append(wr)
 
-        # pass the controller output to the write heads and get memory write weights
-        write_weights = []
-        for i in range(self.read_num):
-            # produces the read head weights
-            weights = self.read_array[i].write_head_address(controller_output, wr_prev, wlu_prev)
-            write_weights.append(weights)
+        # compute sum over keys and weights #TODO: convert to tf functions
+        kts = sum(kts)
+        read_weights_sum = sum(read_weights)
 
-        # create least used weight vector, averaging read vectors
-        wlu = []
-        for i in range(self.read_num):
-            updated_usage = self.gamma * wlu_prev[i] + reduce_sumread_weights[i] + write_weights[i]
-            wlu.append(updated_usage)
+        # pass the controller output to the write heads and get memory write weights
+        write_weights =  self.write_array[i].write_head_address(controller_output, wr_prev, wlu_prev)
+
+        # given write weight vector, read weight vector and previous usage weight, get new update weights
+        wu = self.gamma*wu_prev+read_weights_sum + write_weights
 
         # zero least used memory
         A = A * tf.expand_dims(1 - tf.one_hot(least_indices))
 
         # write to memory using least access information and sum over batches
-        for i in range(self.read_num):
-            A = tf.tanh(A + tf.einsum('bi,bj->ij', write_weights[i], kts[i]))
+        A = tf.tanh(A + tf.einsum('bi,bj->ij', write_weights, kts))
 
-            
         # get read vector using using write weights and updated memory
         read_vectors = []
         for i in range(self.read_num):
@@ -130,14 +151,21 @@ class NTM(Model):
 
         # package iteration state
         self.prev_state = {"memory": A,
-                         "read_weight": wr_t,
-                         "write_weight": ww_t,
-                         "read_vectors":read_vectors,
-                         "usage_weight":wu_t
+                         "read_weight": read_weights_sum,
+                         "write_weight": write_weights,
+                         "usage_weight": wu
                          }
 
 
-        return ntm_output, current_state
+        return ntm_output
+
+
+    def least_used(self, wu):
+        _, indices = tf.nn.top_k(wu, k=self.memrows)
+        wlu = tf.cast(tf.slice(indices, [0, self.memory_size - self.nb_reads], [w_u.get_shape()[0], self.nb_reads]), dtype=tf.int32)
+        wlu = tf.reduce_sum(tf.one_hot(wlu, self.memory_size), axis=1)
+        return indices, wlu
+
 
 
     def train_step(self, data):
@@ -226,13 +254,13 @@ class RevInterface(Layer):
     the weight vector 
     """
 
-    def __init__(self, memory_shape):
+    def __init__(self, memory_shape, **kwargs):
         # setup superclass inheritance 
-        super(RevInterface, self).__init__()
+        super(RevInterface, self).__init__(**kwargs)
 
         # compute and store memory size
-        self.memcols = self.reverie.memshape[1]
-        self.memrows = self.reverie.memshape[0]
+        self.memcols = memory_shape[1]
+        self.memrows = memory_shape[0]
 
 
 # we use seperate read and write head classes since they may not always match in number
@@ -240,9 +268,9 @@ class RevReadHead(RevInterface):
     """
     Performs read operations on memory instances
     """ 
-    def __init__(self, reverie, input_dim, network_topology=None):
+    def __init__(self, network_topology='ff', **kwargs):
         # initiailise controller interface
-        super(RevReadHead, self).__init__(reverie)
+        super(RevReadHead, self).__init__(**kwargs)
  
         # compute and store required network depth
         self.layer_dim = self.memcols
@@ -302,15 +330,13 @@ class RevWriteHead(RevInterface):
     Performs write operations on memory instances
     """
 
-    def __init__(self, read_num, network_topology=None):
+    def __init__(self, network_topology='ff', **kwargs):
         # initiailise controller interface
-        super(RevReadHead, self).__init__(reverie)
+        super(RevWriteHead, self).__init__(**kwargs)
     
-        # number of read heads
-        self.read_num = read_num
 
-        # require a single parameter network (need alpha and gamma)
-        self.layer_dim = self.read_num 
+        # require a single parameter network (need alpha )
+        self.layer_dim = 1 
 
         # network topology for controller head
         if network_topology is 'ff':
@@ -331,9 +357,7 @@ class RevWriteHead(RevInterface):
         alpha = tf.sigmoid(head_output_data)
 
         # return convex combination of previous read weights and write weights
-        write_weights = []
-        for i in range(self.read_num):
-            write_weights.append(  alpha[i] * wr_prev[i] + (1-alpha[i])*wlu_prev[i]  )
+        write_weights = alpha * wr_prev + (1-alpha)*wlu_prev
 
         return write_weights
 
